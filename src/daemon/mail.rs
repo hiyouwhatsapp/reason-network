@@ -74,6 +74,20 @@ const UPGRADE: &str =
 const LOOP_NOTE: &str = "refused: these two agents have exchanged a lot of messages in the last few minutes, which \
                          looks like a loop. Check with your user before continuing.";
 
+// An offline session's unread mail is cleared a day after it was last seen.
+fn offline_note(last_seen: i64, now: i64) -> String {
+    let age = util::ago(last_seen, now);
+    let expires = last_seen.saturating_add(super::sessions::FORGET_MS);
+    if expires <= now {
+        format!("queued: last seen {age} ago; unread mail may be dropped any time")
+    } else {
+        format!(
+            "queued: last seen {age} ago; unread mail is dropped in {} if it stays offline",
+            util::ago(now, expires)
+        )
+    }
+}
+
 impl Daemon {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn send(
@@ -194,9 +208,15 @@ impl Daemon {
                         g.store.insert(&mut msg, false)?;
                         self.deliver(&mut g, &key, vec![msg.clone()], wake)
                     }
-                    Target::Session { key: None, .. } => {
+                    Target::Session { key: None, address } => {
+                        let name = address.split_once('/').map_or("", |(_, n)| n);
+                        let last_seen = g.store.session_by_name(name)?.map(|r| r.last_seen);
                         g.store.insert(&mut msg, false)?;
-                        ("queued".into(), "queued: the session is offline; delivered when it is back".into())
+                        let note = last_seen.map_or_else(
+                            || "queued: the session is offline".into(),
+                            |seen| offline_note(seen, now),
+                        );
+                        ("queued".into(), note)
                     }
                     Target::Remote { machine, .. } => {
                         let takes_files = remotes.get(&machine).is_some_and(|r| r.presence.has(files::FEATURE));
@@ -274,7 +294,11 @@ impl Daemon {
         wake: bool,
     ) -> (String, String) {
         let Some(l) = g.live.get(key) else {
-            return ("queued".into(), "queued: the session is offline; delivered when it is back".into());
+            let note = g.store.session_by_key(key).ok().flatten().map_or_else(
+                || "queued: the session is offline".into(),
+                |r| offline_note(r.last_seen, util::now_ms()),
+            );
+            return ("queued".into(), note);
         };
         if !wake {
             return ("queued".into(), "queued as FYI: it reads it at its next natural pause".into());
@@ -500,7 +524,8 @@ impl Daemon {
             let mut g = self.inner.lock().unwrap();
             self.prune(&mut g);
             let key = g.live.iter().find(|(_, l)| l.name == name).map(|(k, _)| k.clone());
-            if key.is_none() && g.store.session_by_name(name)?.is_none_or(|r| self.cfg.off_in(&r.cwd)) {
+            let remembered = if key.is_none() { g.store.session_by_name(name)? } else { None };
+            if key.is_none() && remembered.as_ref().is_none_or(|r| self.cfg.off_in(&r.cwd)) {
                 return Ok(("refused".into(), format!("no session called {} on {}", msg.to, self.machine)));
             }
             if g.store.has(&msg.id)? {
@@ -535,7 +560,13 @@ impl Daemon {
             let (state, note) = match key {
                 _ if held => ("held".into(), format!("held until {} approves it", self.person)),
                 Some(key) => self.deliver(&mut g, &key, vec![msg.clone()], msg.wake),
-                None => ("queued".into(), "queued: the session is offline; delivered when it is back".into()),
+                None => (
+                    "queued".into(),
+                    remembered.map_or_else(
+                        || "queued: the session is offline".into(),
+                        |r| offline_note(r.last_seen, util::now_ms()),
+                    ),
+                ),
             };
             if msg.notify { (state, format!("{note}; {}", self.notify(&msg).1)) } else { (state, note) }
         };
@@ -739,6 +770,44 @@ mod tests {
         assert_eq!(res.recipients[0].state, "queued");
         let days = d.inner.lock().unwrap().store.counts(util::now_ms()).unwrap();
         assert_eq!(days.iter().map(|d| (d.sent, d.received)).collect::<Vec<_>>(), [(1, 1)]);
+    }
+
+    #[test]
+    fn queued_mail_shows_last_seen_and_expiry() {
+        let hour = 3_600_000;
+        assert_eq!(
+            offline_note(0, 3 * hour),
+            "queued: last seen 3h ago; unread mail is dropped in 21h if it stays offline"
+        );
+        assert_eq!(
+            offline_note(0, 24 * hour),
+            "queued: last seen 1d ago; unread mail may be dropped any time"
+        );
+    }
+
+    #[tokio::test]
+    async fn sending_to_an_offline_session_shows_the_deadline() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let reg = |key: &str| SessionReg {
+            key: key.into(),
+            agent: "codex".into(),
+            cwd: "/work/api".into(),
+            agent_session_id: None,
+            pid: None,
+            tier: Tier::Pull,
+            name: None,
+        };
+        d.register(Some(1), reg("codex:1"), crate::git::GitInfo::default()).unwrap();
+        let to = d.register(Some(2), reg("codex:2"), crate::git::GitInfo::default()).unwrap().address;
+        {
+            let mut g = d.inner.lock().unwrap();
+            g.live.remove("codex:2");
+            let name = to.split_once('/').unwrap().1;
+            g.store.touch_session(name, util::now_ms() - 3 * 3_600_000).unwrap();
+        }
+        let res = d.send("codex:1".into(), &to, "hi", None, true, false, None, Vec::new()).await.unwrap();
+        assert_eq!(res.recipients[0].state, "queued");
+        assert!(res.recipients[0].note.starts_with("queued: last seen 3h ago; unread mail is dropped in "));
     }
 
     #[test]
