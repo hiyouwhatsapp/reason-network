@@ -74,17 +74,21 @@ const UPGRADE: &str =
 const LOOP_NOTE: &str = "refused: these two agents have exchanged a lot of messages in the last few minutes, which \
                          looks like a loop. Check with your user before continuing.";
 
-// An offline session's unread mail is cleared a day after it was last seen.
-fn offline_note(last_seen: i64, now: i64) -> String {
-    let age = util::ago(last_seen, now);
-    let expires = last_seen.saturating_add(super::sessions::FORGET_MS);
-    if expires <= now {
-        format!("queued: last seen {age} ago; unread mail may be dropped any time")
+/// The note for mail queued for a session that is offline. Its unread mail is deleted at the first cleanup a day after
+/// it was last seen, unless it is one of the person's own mailboxes (`cli`), which are kept. Until then, a new session
+/// that takes the name gets the mail.
+fn offline_note(r: Option<&crate::store::Remembered>, now: i64) -> String {
+    const NAME: &str = "a new session that takes this name gets it";
+    let Some(r) = r else { return format!("queued: the session is offline; {NAME}") };
+    let seen = util::ago(r.last_seen, now);
+    let forgotten = r.last_seen.saturating_add(super::sessions::FORGET_MS);
+    if r.agent == "cli" {
+        format!("queued: last seen {seen} ago; {NAME}")
+    } else if forgotten <= now {
+        format!("queued: last seen {seen} ago; unread mail may be dropped any time; {NAME}")
     } else {
-        format!(
-            "queued: last seen {age} ago; unread mail is dropped in {} if it stays offline",
-            util::ago(now, expires)
-        )
+        let left = util::ago(now, forgotten);
+        format!("queued: last seen {seen} ago; unread mail is dropped after about {left} if it stays offline; {NAME}")
     }
 }
 
@@ -210,12 +214,8 @@ impl Daemon {
                     }
                     Target::Session { key: None, address } => {
                         let name = address.split_once('/').map_or("", |(_, n)| n);
-                        let last_seen = g.store.session_by_name(name)?.map(|r| r.last_seen);
+                        let note = offline_note(g.store.session_by_name(name)?.as_ref(), now);
                         g.store.insert(&mut msg, false)?;
-                        let note = last_seen.map_or_else(
-                            || "queued: the session is offline".into(),
-                            |seen| offline_note(seen, now),
-                        );
                         ("queued".into(), note)
                     }
                     Target::Remote { machine, .. } => {
@@ -294,10 +294,7 @@ impl Daemon {
         wake: bool,
     ) -> (String, String) {
         let Some(l) = g.live.get(key) else {
-            let note = g.store.session_by_key(key).ok().flatten().map_or_else(
-                || "queued: the session is offline".into(),
-                |r| offline_note(r.last_seen, util::now_ms()),
-            );
+            let note = offline_note(g.store.session_by_key(key).ok().flatten().as_ref(), util::now_ms());
             return ("queued".into(), note);
         };
         if !wake {
@@ -560,13 +557,7 @@ impl Daemon {
             let (state, note) = match key {
                 _ if held => ("held".into(), format!("held until {} approves it", self.person)),
                 Some(key) => self.deliver(&mut g, &key, vec![msg.clone()], msg.wake),
-                None => (
-                    "queued".into(),
-                    remembered.map_or_else(
-                        || "queued: the session is offline".into(),
-                        |r| offline_note(r.last_seen, util::now_ms()),
-                    ),
-                ),
+                None => ("queued".into(), offline_note(remembered.as_ref(), util::now_ms())),
             };
             if msg.notify { (state, format!("{note}; {}", self.notify(&msg).1)) } else { (state, note) }
         };
@@ -749,6 +740,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::team::TeamState;
     use iroh::SecretKey;
     use serde::Deserialize;
 
@@ -772,23 +764,10 @@ mod tests {
         assert_eq!(days.iter().map(|d| (d.sent, d.received)).collect::<Vec<_>>(), [(1, 1)]);
     }
 
-    #[test]
-    fn queued_mail_shows_last_seen_and_expiry() {
-        let hour = 3_600_000;
-        assert_eq!(
-            offline_note(0, 3 * hour),
-            "queued: last seen 3h ago; unread mail is dropped in 21h if it stays offline"
-        );
-        assert_eq!(
-            offline_note(0, 24 * hour),
-            "queued: last seen 1d ago; unread mail may be dropped any time"
-        );
-    }
+    const HOUR: i64 = 3_600_000;
 
-    #[tokio::test]
-    async fn sending_to_an_offline_session_shows_the_deadline() {
-        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
-        let reg = |key: &str| SessionReg {
+    fn codex(key: &str) -> SessionReg {
+        SessionReg {
             key: key.into(),
             agent: "codex".into(),
             cwd: "/work/api".into(),
@@ -796,18 +775,85 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
-        };
-        d.register(Some(1), reg("codex:1"), crate::git::GitInfo::default()).unwrap();
-        let to = d.register(Some(2), reg("codex:2"), crate::git::GitInfo::default()).unwrap().address;
-        {
-            let mut g = d.inner.lock().unwrap();
-            g.live.remove("codex:2");
-            let name = to.split_once('/').unwrap().1;
-            g.store.touch_session(name, util::now_ms() - 3 * 3_600_000).unwrap();
         }
+    }
+
+    /// Takes a session here offline, last seen `ago` before now. Returns its name.
+    fn gone(d: &Daemon, key: &str, ago: i64) -> String {
+        let mut g = d.inner.lock().unwrap();
+        let name = g.live.remove(key).unwrap().name;
+        g.store.touch_session(&name, util::now_ms() - ago).unwrap();
+        name
+    }
+
+    #[test]
+    fn queued_mail_says_when_it_may_be_dropped_and_who_gets_it() {
+        let seen = |agent: &str| crate::store::Remembered {
+            name: "api-codex".into(),
+            key: "codex:1".into(),
+            agent: agent.into(),
+            cwd: "/work/api".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Pull,
+            last_seen: 0,
+        };
+        let name = "a new session that takes this name gets it";
+        assert_eq!(
+            offline_note(Some(&seen("codex")), 3 * HOUR),
+            format!("queued: last seen 3h ago; unread mail is dropped after about 21h if it stays offline; {name}")
+        );
+        assert_eq!(
+            offline_note(Some(&seen("codex")), 24 * HOUR),
+            format!("queued: last seen 1d ago; unread mail may be dropped any time; {name}")
+        );
+        // The person's own mailboxes are never forgotten.
+        assert_eq!(offline_note(Some(&seen("cli")), 30 * HOUR), format!("queued: last seen 1d ago; {name}"));
+        assert_eq!(offline_note(None, 0), format!("queued: the session is offline; {name}"));
+    }
+
+    #[tokio::test]
+    async fn sending_to_an_offline_session_here_says_when_its_mail_may_be_dropped() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
+        let to = d.register(Some(2), codex("codex:2"), crate::git::GitInfo::default()).unwrap().address;
+        gone(&d, "codex:2", 3 * HOUR);
         let res = d.send("codex:1".into(), &to, "hi", None, true, false, None, Vec::new()).await.unwrap();
         assert_eq!(res.recipients[0].state, "queued");
-        assert!(res.recipients[0].note.starts_with("queued: last seen 3h ago; unread mail is dropped in "));
+        let note = &res.recipients[0].note;
+        assert!(note.starts_with("queued: last seen 3h ago; unread mail is dropped after about 2"), "{note}");
+    }
+
+    #[test]
+    fn a_teammate_sending_to_an_offline_session_is_told_when_its_mail_may_be_dropped() {
+        let cfg = crate::config::Config { person: Some("alex".into()), ..Default::default() };
+        let d = Arc::new(super::super::test_daemon(cfg));
+        let bob = SecretKey::generate();
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        d.inner.lock().unwrap().team = Some(team);
+        d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
+        let name = gone(&d, "codex:1", 3 * HOUR);
+        let msg = Message {
+            id: Ulid::generate().to_string(),
+            from: "bob/web".into(),
+            from_agent: None,
+            from_repo: None,
+            to: format!("alex/{name}"),
+            via: None,
+            reply_to: None,
+            body: "hi".into(),
+            wake: true,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        };
+        let (state, note) = d.receive(bob.public(), msg).unwrap();
+        assert_eq!(state, "queued");
+        assert!(note.starts_with("queued: last seen 3h ago; unread mail is dropped after about 2"), "{note}");
+        assert!(note.ends_with("; a new session that takes this name gets it"), "{note}");
     }
 
     #[test]

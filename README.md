@@ -86,8 +86,7 @@ with [iroh](https://iroh.computer)); if that fails, traffic goes through a relay
 That's Reason's, with computers finding each other through the address lookup of n0 (the company behind iroh), unless
 your team runs its own relay (`reason-network relay <url>`): then your computers contact nothing else, n0 included.
 Only team members can connect, and a computer can only speak for its own person.
-Messages to an offline session wait up to a day after it was last seen. A different session taking the same name can
-receive its waiting mail.
+Messages to someone offline wait and go out when they're back.
 
 Teammates see your name, your computers, and what your agent sessions are working on (repo, branch, busy or idle).
 Signed in with Reason, your name shows as verified: Reason signs that the computer is yours, every teammate's computer
